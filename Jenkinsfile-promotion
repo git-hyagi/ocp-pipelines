@@ -1,0 +1,69 @@
+// nome do pipeline
+def project = params.PROJECT_NAME
+def repo_url = params.SOURCE_REPOSITORY_URL
+def branch = params.SOURCE_REPOSITORY_REF
+def folder = params.CONTEXT_DIR
+def repo_secret = params.SOURCE_SECRET
+
+def openshift_url = params.OPENSHIFT_URL ?: 'console.ocp.example.local:443'
+def pipeline_name = params.PIPELINE ?: 'pipeline'
+def app_name = params.APP_NAME ?: 'demo'
+def change = params.CHANGE ?: 'C1234'
+
+def annotation = params.ANNOTATION ?: "Pipepper_${pipeline_name}_(change_#${change})"
+
+def new_container_image_tag = params.NEW_CONTAINER_IMAGE_TAG ?: 'v2'
+def old_container_image_tag = params.OLD_CONTAINER_IMAGE_TAG ?: 'v1'
+def route_url = "${app_name}-${project}.apps.ocp.example.local"
+def route_name = "route-${app_name.toLowerCase()}"
+
+def artifactory_url_from = params.ARTIFACTORY_URL_FROM ?: "${project}-docker.artifactory.env1.example.local"
+def artifactory_url_to = params.ARTIFACTORY_URL_TO ?: "${project}-docker.artifactory.env2.example.local"
+
+project = "homolog"
+
+def hook_env = params.HOOK_ENV ?: "{\"name\":\"APP_NAME\",\"value\":\"${app_name}\"}," +
+                                  "{\"name\":\"NEW_CONTAINER_IMAGE_TAG\",\"value\":\"${new_container_image_tag}\"}," +
+                                  "{\"name\":\"OLD_CONTAINER_IMAGE_TAG\",\"value\":\"${old_container_image_tag}\"}," +
+                                  "{\"name\":\"CHANGE\",\"value\":\"${change}\"}," +
+                                  "{\"name\":\"PROJECT_NAME\",\"value\":\"${project}\"}," +
+                                  "{\"name\":\"SOURCE_REPOSITORY_URL\",\"value\":\"${repo_url}\"}," +
+                                  "{\"name\":\"SOURCE_REPOSITORY_REF\",\"value\":\"ocp-homolog\"}," +
+                                  "{\"name\":\"CONTEXT_DIR\",\"value\":\"${folder}\"}," +
+                                  "{\"name\":\"SOURCE_SECRET\",\"value\":\"${repo_secret}\"}," +
+                                  "{\"name\":\"PIPELINE\",\"value\":\"${pipeline_name}\"}," +
+                                  "{\"name\":\"ROUTE_NAME\",\"value\":\"${route_name}\"}," +
+                                  "{\"name\":\"ROUTE_URL\",\"value\":\"${route_url}\"}"
+
+def src_image = "${artifactory_url_from}/${app_name}:${new_container_image_tag}"
+def dst_image = "${artifactory_url_to}/${app_name}:${new_container_image_tag}"
+
+pipeline {
+  agent any
+  stages {
+      stage('promote Image') {
+          steps {
+              script {
+                  //openshift.withProject("${project}") {
+                      sh (script: "oc image mirror ${src_image} ${dst_image} --insecure ")
+                      //sh (script: "echo 'teste' > /var/lib/jenkins/.docker/teste.json")
+                  //}
+              }
+          }
+      } //stage('promote Image')
+     
+      stage('hook project pipeline') {
+          steps {
+              script {
+                  //openshift.withProject("${project}") {
+                      def user = sh(script: "oc whoami", returnStdout: true).trim()
+                      echo "${user}"
+                      def token = sh (script: "oc whoami -t", returnStdout: true).trim()
+                      sh (script: "curl -k -H 'Content-Type: application/json' -H \"Authorization: Bearer ${token}\" -X POST \"https://${openshift_url}/apis/build.openshift.io/v1/namespaces/${project}/buildconfigs/${pipeline_name}/instantiate\" -d \'{ \"kind\":\"BuildRequest\", \"apiVersion\":\"build.openshift.io/v1\", \"metadata\":{\"name\":\"${pipeline_name}\",\"creationTimestamp\":null} ,\"env\":[${hook_env}],\"triggeredBy\":[{\"message\":\"${annotation}\"}],\"dockerStrategyOptions\":{}, \"sourceStrategyOptions\":{}}\'")
+                  //}
+              }
+          }
+      } //stage('promote Image')
+
+  } // stages
+} // pipeline

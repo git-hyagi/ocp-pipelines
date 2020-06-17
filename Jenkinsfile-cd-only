@@ -1,0 +1,248 @@
+// nome do pipeline
+def pipeline_name = params.PIPELINE_NAME ?: 'jenkins-pipeline'
+
+//configurações da aplicação
+def new_container_image = params.NEW_CONTAINER_IMAGE ?: 'demo-pipeline'
+def new_container_image_tag = params.NEW_CONTAINER_IMAGE_TAG ?: 'v2'
+def old_container_image = params.OLD_CONTAINER_IMAGE ?: 'demo-pipeline'
+def old_container_image_tag = params.OLD_CONTAINER_IMAGE_TAG ?: 'v1'
+
+def application_properties_mount_path = params.MOUNT_PATH ?: '/opt/apl'
+def prometheus_actuator_port = params.PROMETHEUS_ACTUATOR_PORT ?: '8080'
+def prometheus_actuator_path = params.PROMETHEUS_ACTUATOR_PATH ?: '/actuator/prometheus'
+
+def project= params.PROJECT_NAME ?: 'pipeline-test'
+
+def image_registry_addr = params.IMAGE_REGISTRY_ADDR ?: project
+
+def route_name= params.ROUTE_NAME ?: "route-${pipeline_name.toLowerCase()}"
+
+//parâmetros default para autoscale
+def as_min_pods= params.AS_MIN_PODS ?: 1
+def as_max_pods= params.AS_MAX_PODS ?: 10
+def as_cpu_threshold= params.AS_CPU_THRESHOLD ?: 20
+
+//parâmetros default para load balancer
+def new_app_weight= params.NEW_APP_WEIGHT ?: 10
+def old_app_weight= params.OLD_APP_WEIGHT ?: 90
+
+//parâmetros default para health check
+def health_url= params.HEALTH_URL ?: 'http://'
+def health_port= params.HEALTH_PORT ?: 8080
+def health_delay= params.HEALTH_DELAY ?: 20
+def health_path= params.HEALTH_PATH ?: ''
+
+//repositório onde irá buscar o arquivo de configuração do configmap
+def repo_url= params.SOURCE_REPOSITORY_URL ?: 'git@gitcorp.local:yagi/DemoOpenshift.git'
+def branch= params.SOURCE_REPOSITORY_REF ?: 'ocp-homolog'
+def folder= params.CONTEXT_DIR ?: 'src/main/resources/'
+def repo_secret= params.SOURCE_SECRET ?: 'gitlab'
+
+def route_url= params.ROUTE_URL ?: "${new_container_image}-${project}.apps.example"
+def change_number = params.CHANGE_NUMBER ?: 'C1234'
+
+node {
+    dir("vars_dir") {
+        checkout([$class: 'GitSCM', branches: [[name: "${branch}"]], reference: [["${folder}"]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CleanBeforeCheckout']], gitTool: '${gitInit}',submoduleCfg: [], userRemoteConfigs: [[url: "${repo_url}",credentialsId: project+"-"+repo_secret]] ])
+    }
+    def exists = fileExists "${WORKSPACE}/vars_dir/ocp-pipeline-vars"
+
+    if (exists) {
+        vars = readProperties file:"${WORKSPACE}/vars_dir/ocp-pipeline-vars"
+        pipeline_name = vars['pipeline_name'] ?: pipeline_name
+        new_container_image = vars['new_container_image'] ?: new_container_image
+        new_container_image_tag = vars['new_container_image_tag'] ?: new_container_image_tag
+        old_container_image = vars['old_container_image'] ?: old_container_image
+        old_container_image_tag = vars['old_container_image_tag'] ?: old_container_image_tag
+        application_properties_mount_path = vars['application_properties_mount_path'] ?: application_properties_mount_path
+        prometheus_actuator_port = vars['prometheus_actuator_port'] ?: prometheus_actuator_port
+        prometheus_actuator_path = vars['prometheus_actuator_path'] ?: prometheus_actuator_path
+        project = vars['project'] ?: project
+        image_registry_addr = vars['image_registry_addr'] ?: image_registry_addr
+        route_name = vars['route_name'] ?: route_name
+        as_min_pods = vars['as_min_pods'] ?: as_min_pods
+        as_max_pods = vars['as_max_pods'] ?: as_max_pods
+        as_cpu_threshold = vars['as_cpu_threshold'] ?: as_cpu_threshold
+        new_app_weight = vars['new_app_weight'] ?: new_app_weight
+        old_app_weight = vars['old_app_weight'] ?: old_app_weight
+        health_url = vars['health_url'] ?: health_url
+        health_port = vars['health_port'] ?: health_port
+        health_delay = vars['health_delay'] ?: health_delay
+        health_path = vars['health_path'] ?: health_path
+        repo_url = vars['repo_url'] ?: repo_url
+        branch = vars['branch'] ?: branch
+        folder = vars['folder'] ?: folder
+        repo_secret = vars['repo_secret'] ?: repo_secret
+        route_url = vars['route_url'] ?: route_url
+        change_number = vars['change_number'] ?: change_number
+    }
+}
+
+pipeline {
+    agent any
+    stages {
+
+        // clone config map repo
+        stage('Clone Repo') {
+            steps{
+                dir("fontes") {
+                    checkout([$class: 'GitSCM', branches: [[name: "${branch}"]], reference: [["${folder}"]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CleanBeforeCheckout']], gitTool: '${gitInit}',submoduleCfg: [], userRemoteConfigs: [[url: "${repo_url}",credentialsId: project+"-"+repo_secret]] ])
+                }
+            }
+        } // stage('Clone Repo')
+       
+        // create config map from file
+        stage('configMap') {
+            steps{
+                script {
+                    dir("fontes") {
+                        openshift.withProject("${project}") {
+                            def cmExists = openshift.selector("cm","${new_container_image}-${new_container_image_tag}").exists()
+                            if (!cmExists) {
+                                sh (script: "oc -n ${project} create configmap ${new_container_image}-${new_container_image_tag} --from-file=src/main/resources/application.properties")
+                                sh (script: "oc -n ${project} patch cm ${new_container_image}-${new_container_image_tag} -p \'{\"metadata\": {\"labels\": {\"app\": \"${new_container_image}-${new_container_image_tag}\"}}}\'")
+                                sh (script: "oc -n ${project} annotate cm ${new_container_image}-${new_container_image_tag} created-by=\'Pipeline ${pipeline_name} (change #${change_number})\' --overwrite")
+                            }
+                        }
+                    }
+                }
+            }
+        } // stage('configMap')
+       
+        // create app
+        stage('createApp') {
+            steps {
+                script {
+                    openshift.withProject("${project}") {
+                        def dcExists = openshift.selector("dc","${new_container_image}-${new_container_image_tag}").exists()
+                        if (!dcExists) {
+                            try {
+                                openshift.newApp("${image_registry_addr}/${new_container_image}:${new_container_image_tag} --name=${new_container_image}-${new_container_image_tag}")
+                                sh "oc -n ${project} set volume dc/${new_container_image}-${new_container_image_tag} --configmap-name=${new_container_image}-${new_container_image_tag} --add --mount-path=${application_properties_mount_path}"
+                                sh "oc -n ${project} set env dc/${new_container_image}-${new_container_image_tag} JAVA_OPTS=-Dspring.config.location=${application_properties_mount_path}/application.properties"
+                                sh (script: "oc -n ${project} annotate dc ${new_container_image}-${new_container_image_tag} created-by=\'Pipeline ${pipeline_name} (change #${change_number})\' --overwrite")
+                            } catch(exc) {
+                                // se não conseguir criar o app, remove o cm para não ficar lixo
+                                sh (script: "oc -n ${project} delete configmap ${new_container_image}-${new_container_image_tag}")
+                                throw exc
+                            } finally {
+                                def isExists = openshift.selector("is","${new_container_image}-${new_container_image_tag}").exists()
+                                if (isExists) {
+                                    sh "oc -n ${project} delete is ${new_container_image}-${new_container_image_tag}"
+                                }
+                            }
+                        }
+                      }
+                  }
+            }
+        } //stage('createApp')
+       
+        // config prometheus annotations to enable scrape
+        stage('configPrometheusAnnotations') {
+            steps {
+                script {
+                    openshift.withProject("${project}") {
+                        def config_prom = sh(script: "oc -n ${project} get dc ${new_container_image}-${new_container_image_tag} -o template --template=\'{{index .metadata.annotations \"prometheus.io/port\"}}\'", returnStdout: true).trim()
+                        if (config_prom && config_prom != prometheus_actuator_port) {
+                            // Deployment Config
+                            sh (script: "oc -n ${project} patch dc ${new_container_image}-${new_container_image_tag} -p \'{\"metadata\": {\"annotations\": {\"prometheus.io/path\": \"${prometheus_actuator_path}\", \"prometheus.io/port\": \"${prometheus_actuator_port}\", \"prometheus.io/scrape\": \"true\"}}}\'")
+                           
+                            // Service
+                            sh (script: "oc -n ${project} patch service ${new_container_image}-${new_container_image_tag} -p \'{\"metadata\": {\"annotations\": {\"prometheus.io/path\": \"${prometheus_actuator_path}\", \"prometheus.io/port\": \"${prometheus_actuator_port}\", \"prometheus.io/scrape\": \"true\"}}}\'")
+                            sh (script: "oc -n ${project} annotate service ${new_container_image}-${new_container_image_tag} created-by=\'Pipeline ${pipeline_name} (change #${change_number})\' --overwrite")
+                        }
+                    }
+                }
+            }
+        } // stage('configPrometheusAnnotations')
+       
+        // config health check
+        stage('configHealthCheck') {
+            steps {
+                script {
+                    openshift.withProject("${project}") {
+                        sh "oc -n ${project} set probe dc/${new_container_image}-${new_container_image_tag} --readiness --liveness --get-url=${health_url}:${health_port}/${health_path} --initial-delay-seconds=${health_delay}"
+                    }
+                }
+            }
+        } // stage('configHealthCheck')
+       
+        //Wait until pod is ready to avoid fail in tests
+        stage('wait until pod deployment') {
+            steps {
+                script {
+                    timeout(5) {
+                        waitUntil {
+                            def replicas = sh (script:"oc -n ${project} get dc ${new_container_image}-${new_container_image_tag} -o go-template --template='{{.status.replicas}}'", returnStdout: true).trim()
+                            def ready_replicas = sh (script:"oc -n ${project} get dc ${new_container_image}-${new_container_image_tag} -o go-template --template='{{.status.readyReplicas}}'", returnStdout: true).trim()
+                            echo "${replicas}  ${ready_replicas}"
+                            return (replicas == ready_replicas);
+                        }
+                    }
+                }
+            }
+        } // stage('wait until pod deployment')
+       
+        // update route weights
+        stage('updateRoute') {
+            steps {
+                script {
+                    openshift.withProject("${project}") {
+                        def serviceExists1 = openshift.selector("svc","${new_container_image}-${new_container_image_tag}").exists()
+                        def serviceExists2 = openshift.selector("svc","${old_container_image}-${old_container_image_tag}").exists()
+                        def routeExists = openshift.selector("route","${route_name}").exists()
+                        if (routeExists) {
+                            sh "oc -n ${project} delete route ${route_name}"
+                           
+                        }
+                        sh "oc -n ${project} expose svc/${new_container_image}-${new_container_image_tag} --name=${route_name} --hostname=${route_url}"
+                        sh "oc -n ${project} annotate route/${route_name} haproxy.router.openshift.io/disable_cookies=true --overwrite"
+                        sh "oc -n ${project} annotate route/${route_name} haproxy.router.openshift.io/balance=roundrobin --overwrite"
+                        sh (script: "oc -n ${project} annotate route ${route_name} created-by=\'Pipeline ${pipeline_name} (change #${change_number})\' --overwrite")
+                        if (serviceExists1 && serviceExists2 && ("${new_container_image}-${new_container_image_tag}" != "${old_container_image}-${old_container_image_tag}")) {
+                            sh "oc -n ${project} set route-backends ${route_name} ${new_container_image}-${new_container_image_tag}=${new_app_weight} ${old_container_image}-${old_container_image_tag}=${old_app_weight}"
+                        }
+                    }
+                }
+            }
+        } // stage('updateRoute')
+       
+        // config horizontal pod autoscale
+        stage('hpa') {
+            steps {
+                script {
+                    openshift.withProject("${project}") {
+                        def hpaExists = openshift.selector("hpa","${new_container_image}-${new_container_image_tag}").exists()
+                        if (!hpaExists) {
+                            sh "oc -n ${project} autoscale dc/${new_container_image}-${new_container_image_tag} --min ${as_min_pods} --max ${as_max_pods} --cpu-percent=${as_cpu_threshold}"
+                            sh (script: "oc -n ${project} patch hpa ${new_container_image}-${new_container_image_tag} -p \'{\"metadata\": {\"labels\": {\"app\": \"${new_container_image}-${new_container_image_tag}\"}}}\'")
+                            sh (script: "oc -n ${project} annotate hpa ${new_container_image}-${new_container_image_tag} created-by=\'Pipeline ${pipeline_name} (change #${change_number})\' --overwrite")
+                        }
+                    }
+                }
+            }
+        }  // stage('hpa')
+       
+        // remove hpa
+        // scale dc replicas to 0
+        // add annotation
+        stage('disable old dcs') {
+            steps {
+                script {
+                    openshift.withProject("${project}") {
+                        // get the last - 2 version of deployment config
+                        def older_build = new_container_image_tag.substring(1).toInteger() - 2
+                        def hpaExists = openshift.selector("hpa","${new_container_image}-v${older_build}").exists()
+                        def dcExists = openshift.selector("dc","${new_container_image}-v${older_build}").exists()
+                        if (hpaExists && dcExists) {
+                            sh (script: "oc -n ${project} delete hpa ${new_container_image}-v${older_build}")
+                            sh (script: "oc -n ${project} scale --replicas=0 dc ${new_container_image}-v${older_build}")
+                            sh (script: "oc -n ${project} patch dc ${new_container_image}-v${older_build} -p \'{\"metadata\": {\"annotations\": {\"disabled-by\": \"Pipeline ${pipeline_name} (change #${change_number})\"}}}\'")
+                        }
+                    }
+                }
+            }
+        } //disable old dcs
+
+    } // stages
+} // pipeline 
